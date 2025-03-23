@@ -52,14 +52,15 @@ export default defineConfig({
     },
   },
   server: {
-    host: '0.0.0.0',
+    // host: '0.0.0.0',
+    allowedHosts: ['api.test.local','www.test.local'],
     proxy: {
       '/api': {
-        target: 'http://localhost:3000',
+        target: 'http://localhost:4000',
         changeOrigin: true,
       },
       '/pg': {
-        target: 'http://localhost:3000',
+        target: 'http://localhost:4000',
         changeOrigin: true,
       },
     },
