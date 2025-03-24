@@ -1,6 +1,8 @@
 package setting
 
-var ServerAddress = "http://localhost:3000"
+import "os"
+
+var ServerAddress = os.Getenv("SEVERADDRESS")
 var WorkerUrl = ""
 var WorkerValidKey = ""
 
