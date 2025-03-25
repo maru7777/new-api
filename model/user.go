@@ -1,12 +1,14 @@
 package model
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"one-api/common"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/bytedance/gopkg/util/gopool"
 	"gorm.io/gorm"
@@ -240,16 +242,121 @@ func DeleteUserById(id int) (err error) {
 	if id == 0 {
 		return errors.New("id 为空！")
 	}
-	user := User{Id: id}
-	return user.Delete()
+	// 获取用户信息，以便后续清除缓存使用
+	user, err := GetUserById(id, true)
+	if err != nil {
+		return err
+	}
+	// 1. 先删除该用户的所有token
+	var tokens []*Token
+	if err = DB.Where("user_id = ?", id).Find(&tokens).Error; err != nil {
+		common.SysError("获取用户token失败: " + err.Error())
+		// 继续执行，不要因为无法获取token而中断整个删除流程
+	} else {
+		// 删除所有找到的token
+		for _, token := range tokens {
+			// 先清理缓存
+			if cacheErr := cacheDeleteToken(token.Key); cacheErr != nil {
+				//删除失败也继续删除其他缓存 不中断
+				common.SysError(fmt.Sprintf("清除用户ID=%d的token(ID=%d)缓存失败: %s", user.Id, token.Id, cacheErr.Error()))
+			}
+			//软删除token
+			if tokenErr := token.Delete(); tokenErr != nil {
+				common.SysError(fmt.Sprintf("删除用户ID=%d的token(ID=%d)失败: %s", id, token.Id, tokenErr.Error()))
+				// 继续删除其他token
+			}
+		}
+	}
+	// 2. 处理RDB1缓存
+	if common.RedisEnabled && common.RDB1 != nil && user.Email != "" {
+		ctx := context.Background()
+		// 添加重试逻辑
+		maxRetries := 3
+		for i := 0; i < maxRetries; i++ {
+			err := common.RDB1.Del(ctx, user.Email).Err()
+			if err == nil {
+				common.SysLog("成功从Redis中删除用户数据，邮箱: " + user.Email)
+				break
+			}
+
+			if i == maxRetries-1 {
+				common.SysError(fmt.Sprintf("多次尝试后仍无法从Redis中删除用户数据: %s", err.Error()))
+				// 不要返回错误，继续执行后续删除操作
+			} else {
+				common.SysLog(fmt.Sprintf("第%d次尝试删除Redis数据失败，将重试: %s", i+1, err.Error()))
+				time.Sleep(time.Millisecond * 100 * time.Duration(i+1))
+			}
+		}
+	}
+	// 3. 最后删除用户数据
+	if err := DB.Delete(user).Error; err != nil {
+		return err
+	}
+	// 4. 清除RDB缓存
+	if err := invalidateUserCache(user.Id); err != nil {
+		return err
+	}
+	return nil
 }
 
 func HardDeleteUserById(id int) error {
 	if id == 0 {
 		return errors.New("id 为空！")
 	}
-	err := DB.Unscoped().Delete(&User{}, "id = ?", id).Error
-	return err
+	// 获取用户信息，以便后续清除缓存使用
+	user, err := GetUserById(id, true)
+	if err != nil {
+		return err
+	}
+	// 1. 先硬删除该用户的所有token
+	var tokens []*Token
+	if err = DB.Where("user_id = ?", id).Find(&tokens).Error; err != nil {
+		common.SysError("获取用户token失败: " + err.Error())
+		// 继续执行，不要因为无法获取token而中断整个删除流程
+	} else {
+		// 硬删除所有找到的token
+		for _, token := range tokens {
+			// 先清理缓存
+			if cacheErr := cacheDeleteToken(token.Key); cacheErr != nil {
+				common.SysError(fmt.Sprintf("清除用户ID=%d的token(ID=%d)缓存失败: %s", id, token.Id, cacheErr.Error()))
+			}
+			// 然后硬删除token
+			if tokenErr := DB.Unscoped().Delete(token).Error; tokenErr != nil {
+				common.SysError(fmt.Sprintf("硬删除用户ID=%d的token(ID=%d)失败: %s", id, token.Id, tokenErr.Error()))
+				// 继续删除其他token
+			}
+		}
+	}
+	// 2. 处理RDB1缓存
+	if common.RedisEnabled && common.RDB1 != nil && user.Email != "" {
+		ctx := context.Background()
+		// 添加重试逻辑
+		maxRetries := 3
+		for i := 0; i < maxRetries; i++ {
+			err := common.RDB1.Del(ctx, user.Email).Err()
+			if err == nil {
+				common.SysLog("成功从Redis中删除用户数据，邮箱: " + user.Email)
+				break
+			}
+
+			if i == maxRetries-1 {
+				common.SysError(fmt.Sprintf("多次尝试后仍无法从Redis中删除用户数据: %s", err.Error()))
+				// 不要返回错误，继续执行后续删除操作
+			} else {
+				common.SysLog(fmt.Sprintf("第%d次尝试删除Redis数据失败，将重试: %s", i+1, err.Error()))
+				time.Sleep(time.Millisecond * 100 * time.Duration(i+1))
+			}
+		}
+	}
+	// 3. 硬删除用户数据
+	if err := DB.Unscoped().Delete(user).Error; err != nil {
+		return err
+	}
+	// 4. 清除RDB缓存
+	if err := invalidateUserCache(user.Id); err != nil {
+		return err
+	}
+	return nil
 }
 
 func inviteUser(inviterId int) (err error) {
@@ -308,6 +415,23 @@ func (user *User) Insert(inviterId int) error {
 			return err
 		}
 	}
+
+	// 在创建新用户前，删除Redis中同名邮箱的历史缓存数据.当用同名邮箱先注销再注册时会用到
+	if common.RedisEnabled && common.RDB1 != nil && user.Email != "" {
+		ctx := context.Background()
+		// 检查是否存在旧数据并删除
+		exists, err := common.RDB1.Exists(ctx, user.Email).Result()
+		if err == nil && exists > 0 {
+			// 记录日志并删除
+			common.SysLog(fmt.Sprintf("检测到邮箱 %s 的旧缓存数据，正在清除", user.Email))
+			if err := common.RDB1.Del(ctx, user.Email).Err(); err != nil {
+				common.SysError("清除Redis中的旧用户数据失败: " + err.Error())
+				// 继续执行，不返回错误
+			}
+		}
+	}
+
+	// 原有的用户创建逻辑
 	user.Quota = common.QuotaForNewUser
 	//user.SetAccessToken(common.GetUUID())
 	user.AffCode = common.GetRandomString(4)
@@ -345,7 +469,6 @@ func (user *User) Update(updatePassword bool) error {
 	if err = DB.Model(user).Updates(newUser).Error; err != nil {
 		return err
 	}
-
 	// Update cache
 	return updateUserCache(*user)
 }
@@ -383,20 +506,109 @@ func (user *User) Delete() error {
 	if user.Id == 0 {
 		return errors.New("id 为空！")
 	}
+	// 1. 先删除该用户的所有token
+	var tokens []*Token
+	if err := DB.Where("user_id = ?", user.Id).Find(&tokens).Error; err != nil {
+		common.SysError("获取用户token失败: " + err.Error())
+		// 继续执行，不要因为无法获取token而中断整个删除流程
+	} else {
+		// 删除所有找到的token
+		for _, token := range tokens {
+			// 先清理缓存
+			if cacheErr := cacheDeleteToken(token.Key); cacheErr != nil {
+				common.SysError(fmt.Sprintf("清除用户ID=%d的token(ID=%d)缓存失败: %s", user.Id, token.Id, cacheErr.Error()))
+			}
+			// 然后软删除token
+			if tokenErr := token.Delete(); tokenErr != nil {
+				common.SysError(fmt.Sprintf("删除用户ID=%d的token(ID=%d)失败: %s", user.Id, token.Id, tokenErr.Error()))
+				// 继续删除其他token
+			}
+		}
+	}
+	// 2. 处理RDB1缓存
+	if common.RedisEnabled && common.RDB1 != nil && user.Email != "" {
+		ctx := context.Background()
+		// 添加重试逻辑
+		maxRetries := 3
+		for i := 0; i < maxRetries; i++ {
+			err := common.RDB1.Del(ctx, user.Email).Err()
+			if err == nil {
+				common.SysLog("成功从Redis中删除用户数据，邮箱: " + user.Email)
+				break
+			}
+
+			if i == maxRetries-1 {
+				common.SysError(fmt.Sprintf("多次尝试后仍无法从Redis中删除用户数据: %s", err.Error()))
+				// 不要返回错误，继续执行后续删除操作
+			} else {
+				common.SysLog(fmt.Sprintf("第%d次尝试删除Redis数据失败，将重试: %s", i+1, err.Error()))
+				time.Sleep(time.Millisecond * 100 * time.Duration(i+1))
+			}
+		}
+	}
+	// 3. 软删除用户数据
 	if err := DB.Delete(user).Error; err != nil {
 		return err
 	}
-
-	// 清除缓存
-	return invalidateUserCache(user.Id)
+	// 4. 清除RDB缓存
+	if err := invalidateUserCache(user.Id); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (user *User) HardDelete() error {
 	if user.Id == 0 {
 		return errors.New("id 为空！")
 	}
-	err := DB.Unscoped().Delete(user).Error
-	return err
+	// 1. 先硬删除该用户的所有token
+	var tokens []*Token
+	if err := DB.Where("user_id = ?", user.Id).Find(&tokens).Error; err != nil {
+		common.SysError("获取用户token失败: " + err.Error())
+		// 继续执行，不要因为无法获取token而中断整个删除流程
+	} else {
+		// 硬删除所有找到的token
+		for _, token := range tokens {
+			// 先清理缓存
+			if cacheErr := cacheDeleteToken(token.Key); cacheErr != nil {
+				common.SysError(fmt.Sprintf("清除用户ID=%d的token(ID=%d)缓存失败: %s", user.Id, token.Id, cacheErr.Error()))
+			}
+			// 然后硬删除token
+			if tokenErr := DB.Unscoped().Delete(token).Error; tokenErr != nil {
+				common.SysError(fmt.Sprintf("硬删除用户ID=%d的token(ID=%d)失败: %s", user.Id, token.Id, tokenErr.Error()))
+				// 继续删除其他token
+			}
+		}
+	}
+	// 2. 处理RDB1缓存
+	if common.RedisEnabled && common.RDB1 != nil && user.Email != "" {
+		ctx := context.Background()
+		// 添加重试逻辑
+		maxRetries := 3
+		for i := 0; i < maxRetries; i++ {
+			err := common.RDB1.Del(ctx, user.Email).Err()
+			if err == nil {
+				common.SysLog("成功从Redis中删除用户数据，邮箱: " + user.Email)
+				break
+			}
+			if i == maxRetries-1 {
+				common.SysError(fmt.Sprintf("多次尝试后仍无法从Redis中删除用户数据: %s", err.Error()))
+				// 不要返回错误，继续执行后续删除操作
+			} else {
+				common.SysLog(fmt.Sprintf("第%d次尝试删除Redis数据失败，将重试: %s", i+1, err.Error()))
+				time.Sleep(time.Millisecond * 100 * time.Duration(i+1))
+			}
+		}
+	}
+	// 3. 软删除用户数据
+	if err := DB.Unscoped().Delete(user).Error; err != nil {
+		return err
+	}
+	// 4. 清除RDB缓存
+	if err := invalidateUserCache(user.Id); err != nil {
+		return err
+	}
+	return nil
 }
 
 // ValidateAndFill check password & user status

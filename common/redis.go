@@ -14,13 +14,21 @@ import (
 )
 
 var RDB *redis.Client
+var RDB1 *redis.Client
+var Sync2webui = false
 var RedisEnabled = true
 
 // InitRedisClient This function is called after init()
 func InitRedisClient() (err error) {
-	if os.Getenv("REDIS_CONN_STRING") == "" {
+	if os.Getenv("SYNC_2_WEBUI") == "true" {
+		Sync2webui = true
+	} else {
+		Sync2webui = false
+		SysLog("SYNC_2_WEBUI not set or set to false, sync2webui will not be performed")
+	}
+	if os.Getenv("REDIS_CONN_STRING") == "" || os.Getenv("REDIS_CONN_STRING_1") == "" {
 		RedisEnabled = false
-		SysLog("REDIS_CONN_STRING not set, Redis is not enabled")
+		SysLog("REDIS_CONN_STRING or REDIS_CONN_STRING_1 not set, Redis is not enabled")
 		return nil
 	}
 	if os.Getenv("SYNC_FREQUENCY") == "" {
@@ -31,9 +39,17 @@ func InitRedisClient() (err error) {
 	opt, err := redis.ParseURL(os.Getenv("REDIS_CONN_STRING"))
 	if err != nil {
 		FatalLog("failed to parse Redis connection string: " + err.Error())
+		return err
 	}
 	opt.PoolSize = GetEnvOrDefault("REDIS_POOL_SIZE", 10)
 	RDB = redis.NewClient(opt)
+
+	opt1, err := redis.ParseURL(os.Getenv("REDIS_CONN_STRING_1"))
+	if err != nil {
+		FatalLog("failed to parse Redis connection string: " + err.Error())
+		return err
+	}
+	RDB1 = redis.NewClient(opt1)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -41,10 +57,17 @@ func InitRedisClient() (err error) {
 	_, err = RDB.Ping(ctx).Result()
 	if err != nil {
 		FatalLog("Redis ping test failed: " + err.Error())
+		return err
+	}
+	if _, err = RDB1.Ping(ctx).Result(); err != nil {
+		FatalLog("Redis DB 1 ping test failed: " + err.Error())
+		return err
 	}
 	if DebugEnabled {
 		SysLog(fmt.Sprintf("Redis connected to %s", opt.Addr))
 		SysLog(fmt.Sprintf("Redis database: %d", opt.DB))
+		SysLog(fmt.Sprintf("Redis connected to %s", opt1.Addr))
+		SysLog(fmt.Sprintf("Redis database: %d", opt1.DB))
 	}
 	return err
 }
@@ -97,7 +120,26 @@ func RedisHDelObj(key string) error {
 		SysLog(fmt.Sprintf("Redis HDEL: key=%s", key))
 	}
 	ctx := context.Background()
-	return RDB.HDel(ctx, key).Err()
+	// 首先检查键是否存在
+	exists, err := RDB.Exists(ctx, key).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return fmt.Errorf("检查键是否存在时出错: %w", err)
+	}
+	// 如果键不存在，直接返回nil（视为成功）
+	if exists == 0 {
+		if DebugEnabled {
+			SysLog(fmt.Sprintf("Redis HDEL: 键 %s 不存在，视为删除成功", key))
+		}
+		return nil
+	}
+	// 如果键存在，尝试删除
+	err = RDB.HDel(ctx, key).Err()
+	if err != nil && errors.Is(err, redis.Nil) {
+		// 如果返回redis.Nil，这通常表示键不存在或已经被其他操作删除
+		// 我们也将其视为成功操作
+		return nil
+	}
+	return err
 }
 
 func RedisHSetObj(key string, obj interface{}, expiration time.Duration) error {

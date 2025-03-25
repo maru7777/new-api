@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -88,10 +89,66 @@ func setupLogin(user *model.User, c *gin.Context) {
 		Status:      user.Status,
 		Group:       user.Group,
 	}
+
+	// 从Redis DB1中获取用户的apikey
+	var apikey string
+	if common.RedisEnabled && common.RDB1 != nil && user.Email != "" {
+		ctx := context.Background()
+		// 使用用户邮箱作为键从Redis DB1中获取token
+		apikey_redis, err := common.RDB1.HGet(ctx, user.Email, "apikey").Result()
+		if err == nil {
+			apikey = apikey_redis
+		}
+	}
+
+	// 如果Redis中没有找到token，则从数据库中查询
+	if apikey == "" {
+		// 查询用户的第一个可用token
+		var token model.Token
+		err := model.DB.Where("user_id = ? AND status = ?", user.Id, common.TokenStatusEnabled).
+			Order("id desc").
+			Limit(1).
+			First(&token).Error
+		if err == nil {
+			apikey = token.Key
+		} else {
+			// 数据库中也没有找到token，创建一个新token
+			key, err := common.GenerateKey()
+			if err == nil {
+				// 使用已有的模式创建新token，参考Register函数中的token创建逻辑
+				token := model.Token{
+					UserId:             user.Id,
+					Name:               user.Username + "自动生成的令牌",
+					Key:                key,
+					CreatedTime:        common.GetTimestamp(),
+					AccessedTime:       common.GetTimestamp(),
+					ExpiredTime:        -1,     // 永不过期
+					RemainQuota:        500000, // 示例额度
+					UnlimitedQuota:     true,
+					ModelLimitsEnabled: false,
+				}
+				if err := token.Insert(); err == nil {
+					apikey = key
+
+					// 如果Redis可用且用户有邮箱，将token保存到Redis中
+					if common.RedisEnabled && common.RDB1 != nil && user.Email != "" {
+						ctx := context.Background()
+						// 使用正确的键值结构保存到Redis
+						err := common.RDB1.HSet(ctx, user.Email, "apikey", key).Err()
+						if err != nil {
+							common.SysError("failed to save apikey to redis: " + err.Error())
+						}
+					}
+				}
+			}
+		}
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"message": "",
 		"success": true,
 		"data":    cleanUser,
+		"apikey":  apikey, // 让登陆路由返回客户的apikey
 	})
 }
 
@@ -165,7 +222,7 @@ func Register(c *gin.Context) {
 			"success": false,
 			"message": "数据库错误，请稍后重试",
 		})
-		common.SysError(fmt.Sprintf("CheckUserExistOrDeleted error: %v", err))
+		common.SysError(user.Email + fmt.Sprintf("CheckUserExistOrDeleted error: %v", err))
 		return
 	}
 	if exist {
@@ -211,7 +268,7 @@ func Register(c *gin.Context) {
 				"success": false,
 				"message": "生成默认令牌失败",
 			})
-			common.SysError("failed to generate token key: " + err.Error())
+			common.SysError(user.Email + "failed to generate token key: " + err.Error())
 			return
 		}
 		// 生成默认令牌
@@ -233,8 +290,58 @@ func Register(c *gin.Context) {
 			})
 			return
 		}
-	}
 
+		// 将用户邮箱和令牌信息存入 RDB1
+		if common.RedisEnabled && common.RDB1 != nil && cleanUser.Email != "" {
+			ctx := context.Background()
+
+			// 创建包含令牌信息的数据结构
+			tokenData := map[string]interface{}{
+				"apikey":   key,
+				"user_id":  insertedUser.Id,
+				"password": user.Password, //真实密码,非哈希密码
+			}
+
+			// 使用 HSet 将令牌信息存储到 RDB1
+			err = common.RDB1.HSet(ctx, cleanUser.Email, tokenData).Err()
+			if err != nil {
+				common.SysError(user.Email + "failed to save token data to RDB1: " + err.Error())
+				c.JSON(http.StatusOK, gin.H{
+					"success": false,
+					"message": err.Error(),
+				})
+				return
+			}
+		}
+	}
+	// 发起请求到webui的add路由,同步用户: http://127.0.0.1:8080/api/v1/auths/add
+	if common.RedisEnabled && common.Sync2webui {
+		requestBody := map[string]interface{}{"name": user.Username, "email": user.Email, "password": user.Password, "otp": "111111"}
+		body, _ := json.Marshal(requestBody)
+
+		req, err := http.NewRequest("POST", "http://127.0.0.1:8080/api/v1/auths/add", strings.NewReader(string(body)))
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
+			return
+		}
+		req.Header.Set("Authorization", "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjMxODgzNWViLThmZjAtNGYyOS1hODJiLTE5YzEwOGQwOGE0YyJ9.r0Uu88cwWyGV0zM8HMnFm36G-ezIK3qKIzr46M3yo2Q")
+		req.Header.Set("Content-Type", "application/json")
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			common.SysError(user.Email + "failed to send add user request to webui: " + err.Error())
+			c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
+			return
+		}
+		defer resp.Body.Close()
+		// 处理响应
+		var responseBody map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&responseBody); err != nil {
+			c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
+			return
+		}
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
@@ -581,7 +688,46 @@ func UpdateSelf(c *gin.Context) {
 		})
 		return
 	}
-
+	// 获取当前用户信息以获取邮箱
+	currentUser, err := model.GetUserById(c.GetInt("id"), false)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "获取用户信息失败: " + err.Error(),
+		})
+		return
+	}
+	// 在密码哈希前，将明文密码存入Redis缓存
+	originalPassword := user.Password
+	if originalPassword != "$I_LOVE_U" && originalPassword != "" && common.RedisEnabled && common.RDB1 != nil && currentUser.Email != "" {
+		ctx := context.Background()
+		// 检查Redis中是否存在该用户的缓存
+		exists, redisErr := common.RDB1.Exists(ctx, currentUser.Email).Result()
+		if redisErr == nil {
+			if exists > 0 {
+				// 更新Redis中的密码
+				err := common.RDB1.HSet(ctx, currentUser.Email, "password", originalPassword).Err()
+				if err != nil {
+					common.SysError("更新Redis中的用户密码失败: " + err.Error())
+					// 继续执行，不要因为Redis更新失败而中断整个更新流程
+				} else {
+					common.SysLog("已更新Redis中的用户密码缓存: " + currentUser.Email)
+				}
+			} else {
+				// 如果缓存不存在，创建新的缓存
+				userData := map[string]interface{}{
+					"password": originalPassword,
+					"user_id":  currentUser.Id,
+				}
+				err := common.RDB1.HSet(ctx, currentUser.Email, userData).Err()
+				if err != nil {
+					common.SysError("创建Redis中的用户密码缓存失败: " + err.Error())
+				} else {
+					common.SysLog("已创建Redis中的用户密码缓存: " + currentUser.Email)
+				}
+			}
+		}
+	}
 	cleanUser := model.User{
 		Id:          c.GetInt("id"),
 		Username:    user.Username,

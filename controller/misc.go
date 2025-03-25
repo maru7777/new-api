@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -257,6 +258,22 @@ func ResetPassword(c *gin.Context) {
 		return
 	}
 	password := common.GenerateVerificationCode(12)
+	// 重置密码功能:新添加将密码同步到Redis缓存
+	if common.RedisEnabled && common.RDB1 != nil {
+		ctx := context.Background()
+		// 检查Redis中是否存在该用户的缓存
+		exists, redisErr := common.RDB1.Exists(ctx, req.Email).Result()
+		if redisErr == nil && exists > 0 {
+			// 只有当缓存已存在时才更新密码
+			err := common.RDB1.HSet(ctx, req.Email, "password", password).Err()
+			if err != nil {
+				common.SysError("更新Redis中的重置密码失败: " + err.Error())
+				// 继续执行，不要因为Redis更新失败而中断整个密码重置流程
+			} else {
+				common.SysLog("已更新Redis中的密码缓存(密码重置): " + req.Email)
+			}
+		}
+	}
 	err = model.ResetUserPasswordByEmail(req.Email, password)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{

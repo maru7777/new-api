@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"one-api/common"
@@ -25,7 +26,7 @@ type Token struct {
 	ModelLimits        string         `json:"model_limits" gorm:"type:varchar(1024);default:''"`
 	AllowIps           *string        `json:"allow_ips" gorm:"default:''"`
 	UsedQuota          int            `json:"used_quota" gorm:"default:0"` // used quota
-	Group              string         `json:"group" gorm:"default:''"`
+	Group              string         `json:"group" gorm:"default:'default'"`
 	DeletedAt          gorm.DeletedAt `gorm:"index"`
 }
 
@@ -210,6 +211,38 @@ func (token *Token) Delete() (err error) {
 				err := cacheDeleteToken(token.Key)
 				if err != nil {
 					common.SysError("failed to delete token cache: " + err.Error())
+				}
+
+				// 被删除的token不见得和redis里的相同,相同时才将redis里的apikey置空
+				var user User
+				userErr := DB.Where("id = ?", token.UserId).First(&user).Error
+				if userErr != nil {
+					// 用户可能已被删除，这是正常情况，不需要处理Redis
+					common.SysLog("user not found when deleting token, possibly already deleted")
+					return
+				}
+
+				// 检查Redis中是否有该用户邮箱关联的apikey
+				if common.RedisEnabled && common.RDB1 != nil && user.Email != "" {
+					ctx := context.Background()
+					// 先检查key是否存在
+					exists, redisErr := common.RDB1.Exists(ctx, user.Email).Result()
+					if redisErr != nil || exists == 0 {
+						common.SysLog("email key not found in redis, possibly already deleted")
+						return
+					}
+
+					// 获取存储在Redis中的apikey
+					apikey, redisErr := common.RDB1.HGet(ctx, user.Email, "apikey").Result()
+					if redisErr == nil && apikey == token.Key {
+						// 如果Redis中存储的apikey与要删除的token.Key相同，则将其置空
+						err := common.RDB1.HSet(ctx, user.Email, "apikey", "").Err()
+						if err != nil {
+							common.SysError("failed to clear apikey in redis: " + err.Error())
+						} else {
+							common.SysLog("cleared apikey in redis for email: " + user.Email)
+						}
+					}
 				}
 			})
 		}
