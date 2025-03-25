@@ -1,8 +1,8 @@
 package setting
 
-import "os"
+import "one-api/common"
 
-var ServerAddress = os.Getenv("SEVERADDRESS")
+var ServerAddress = common.GetEnvOrDefaultString("SEVERADDRESS", "http://api.test.local") // http://localhost:4000
 var WorkerUrl = ""
 var WorkerValidKey = ""
 
